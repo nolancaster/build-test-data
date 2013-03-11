@@ -5,6 +5,7 @@ import org.apache.commons.logging.LogFactory
 import org.codehaus.groovy.grails.commons.GrailsDomainClass
 import static grails.buildtestdata.DomainUtil.*
 import static grails.buildtestdata.TestDataConfigurationHolder.*
+import grails.buildtestdata.CircularCheckList
 
 public class NullableConstraintHandler implements ConstraintHandler {
     private static log = LogFactory.getLog(this)
@@ -70,32 +71,28 @@ public class NullableConstraintHandler implements ConstraintHandler {
         if (domainProp?.isOneToOne()
             || (domain.metaClass.properties.name.contains('embedded')
                 && domain.embedded.contains(propertyName))) {
-            if (circularCheckList."${constrainedProperty?.propertyType.name}") {
-                domain."$propertyName" = circularCheckList."${constrainedProperty?.propertyType.name}"
-            } else {
-                domain."$propertyName" = domainProp.type.buildWithoutSave([:], circularCheckList)
-            }
+
+            domain."$propertyName" = circularCheckList.retrieve(domainProp?.referencedDomainClass) ?:
+                domainProp.type.buildWithoutSave([:], circularCheckList)
+
         } else if (domainProp?.isManyToOne()) {
             // book has an author, and author isManyToOne to book
-            def owningObject
-            if (circularCheckList."${constrainedProperty?.propertyType.name}") {
-                owningObject = circularCheckList."${constrainedProperty?.propertyType.name}"
-            } else {
-                owningObject = domainProp.type.build([:], circularCheckList)
-            }
+            def owningObject = circularCheckList.retrieve(domainProp?.referencedDomainClass) ?:
+                domainProp.type.build([:], circularCheckList)
+
             domain."$propertyName" = owningObject
 
             addInstanceToOwningObjectCollection(owningObject, domain, domainProp)
         } else if (domainProp?.isOneToMany() || domainProp?.isManyToMany()) {
             // author has many books, and author isOneToMany books
             // the build invocation below will set the books author on build, by getting it from the cirularChecklist
-            def ownedObject
-            if (circularCheckList."${constrainedProperty?.propertyType.name}") {
-                ownedObject = circularCheckList."${domainProp?.referencedPropertyType.name}"
-            } else {
-                ownedObject = domainProp?.referencedPropertyType.buildWithoutSave([:], circularCheckList)
-            }
+            println "Domain: ${domain.class}, Prop: $propertyName"
+            def ownedObject = circularCheckList.retrieve(domainProp?.referencedDomainClass) ?:
+                domainProp.referencedPropertyType.buildWithoutSave([:], circularCheckList)
+
             domain."addTo${capitalize(propertyName)}"(ownedObject)
+
+//            domain."$propertyName" = [].asType(domainProp.type)
         } else {
             throw new Exception("can't cope with unset non-nullable property $propertyName of ${domain.class.name}")
         }

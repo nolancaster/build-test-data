@@ -23,6 +23,7 @@ import static grails.buildtestdata.DomainUtil.*
 import org.codehaus.groovy.grails.commons.GrailsDomainClass
 import org.codehaus.groovy.grails.orm.hibernate.cfg.CompositeIdentity
 import org.codehaus.groovy.grails.orm.hibernate.cfg.GrailsDomainBinder
+import org.codehaus.groovy.grails.commons.DefaultGrailsDomainClass
 
 public class DomainInstanceBuilder {
     private static log = LogFactory.getLog(this)
@@ -69,6 +70,9 @@ public class DomainInstanceBuilder {
     def domainProperties
     def requiredDomainPropertyNames
     def propsToSaveFirst
+    def ownedProps
+    def owningProps
+    def collectionProps
 
     DomainInstanceBuilder(domainArtefact) {
 
@@ -84,8 +88,11 @@ public class DomainInstanceBuilder {
         this.constrainedProperties = domainArtefact.constrainedProperties
         this.requiredPropertyNames = findRequiredPropertyNames(domainArtefact)
         this.domainProperties = findDomainProperties(domainArtefact)
-        this.requiredDomainPropertyNames = findRequiredDomainPropertyNames(domainProperties, requiredPropertyNames)
-        this.propsToSaveFirst = findPropsToSaveFirst()
+        findRequiredDomainPropertyNames()
+//        this.requiredDomainPropertyNames = findRequiredDomainPropertyNames(domainProperties, requiredPropertyNames)
+//        this.owningProps = findOwningProps()
+//        this.propsToSaveFirst = findPropsToSaveFirst()
+//        this.ownedProps = findOwnedProps()
     }
 
     def findRequiredPropertyNames(domainArtefact) {
@@ -102,16 +109,58 @@ public class DomainInstanceBuilder {
         }
     }
 
-    def findRequiredDomainPropertyNames(domainProperties, requiredPropertyNames) {
-        return domainProperties*.propertyName.intersect(requiredPropertyNames)
+    def findRequiredDomainPropertyNames() {
+        requiredDomainPropertyNames = []
+        owningProps = []
+        ownedProps = []
+        collectionProps = []
+        ((DefaultGrailsDomainClass)domainArtefact).associations.each { association ->
+            if(!association.embedded && !association.hasOne) {
+                requiredDomainPropertyNames << association.name
+
+                if (association.oneToMany || association.manyToMany) {
+                    collectionProps << association.name
+                }
+                if(association.bidirectional) {
+                    if((association.manyToOne || association.manyToMany) && association.otherSide.owningSide) {
+                        owningProps << association.name
+                    }
+                    else if((association.oneToMany || association.manyToMany) && association.owningSide ||
+                            association.otherSide.domainClass.owners.any{ it.isAssignableFrom(domainClass) }) {
+                        ownedProps << association.name
+                    }
+                }
+            }
+        }
+        propsToSaveFirst = requiredDomainPropertyNames - (owningProps + ownedProps)
     }
 
     def findPropsToSaveFirst() {
         if (domainClass.metaClass.properties.name.contains('hasOne') && domainClass.hasOne in Map) {
             // this class is the owning side of the hasOne and should be saved before it
-            return requiredDomainPropertyNames.findAll { domainClass.hasOne[it] == null }
+            return requiredDomainPropertyNames.findAll { domainClass.hasOne[it] == null && !owningProps.contains(it) }
         }
-        requiredDomainPropertyNames
+        requiredDomainPropertyNames - owningProps
+    }
+
+    def findOwnedProps() {
+        ((DefaultGrailsDomainClass)domainArtefact).associations.findAll { association ->
+            !association.optional &&
+            !association.embedded &&
+            association.bidirectional &&
+            (association.manyToOne || association.manyToMany) &&
+            (association.owningSide)
+        }*.name
+    }
+
+    def findOwningProps() {
+        ((DefaultGrailsDomainClass)domainArtefact).associations.findAll { association ->
+            !association.optional &&
+            !association.embedded &&
+            association.bidirectional &&
+            (association.manyToOne || association.manyToMany) &&
+            association.otherSide.owningSide
+        }*.name
     }
 
     def findExisting() {
@@ -124,37 +173,41 @@ public class DomainInstanceBuilder {
         return domainClass.findWhere(propValues)
     }
 
-    def buildWithoutSave(propValues, CircularCheckList circularCheckList = new CircularCheckList()) {
-        def domainInstance = populateInstance(domainClass.newInstance(), propValues, circularCheckList)
+    def buildWithoutSave(propValues, CircularCheckList circularCheckList = new CircularCheckList(), Closure optConfig = null) {
+        def domainInstance = populateInstance(domainClass.newInstance(), propValues, circularCheckList, optConfig)
         circularCheckList.update(domainInstance, domainInstance.validate())
         return domainInstance
     }
 
-    def build(propValues, CircularCheckList circularCheckList = new CircularCheckList()) {
-        def domainInstance = populateInstance(domainClass.newInstance(), propValues, circularCheckList)
-        domainInstance = save(domainInstance)
+    def build(propValues, CircularCheckList circularCheckList = new CircularCheckList(), Closure optConfig = null) {
+        def domainInstance = populateInstance(domainClass.newInstance(), propValues, circularCheckList, optConfig)
+        save(domainInstance)
 
         // TODO: do we really need to validate here?  What does that add?
         circularCheckList.update(domainInstance, domainInstance.validate())
         return domainInstance
     }
 
-    def populateInstance(domainInstance, Map propValues, CircularCheckList circularCheckList) {
+    def populateInstance(domainInstance, Map propValues, CircularCheckList circularCheckList, Closure optConfig = null) {
+        withAdditionalConfig(optConfig) {
+            propValues = findMissingConfigValues(propValues) + propValues
 
-        propValues = findMissingConfigValues(propValues) + propValues
+            for (property in propValues.keySet()) {
+                setDomainPropertyValue(domainInstance, property, propValues[property])
+            }
 
-        for (property in propValues.keySet()) {
-            setDomainPropertyValue(domainInstance, property, propValues[property])
-        }
+            def requiredMissingPropertyNames = (requiredPropertyNames - propValues.keySet()).findAll { propName ->
+                !domainInstance."$propName"
+            }
 
-        def requiredMissingPropertyNames = (requiredPropertyNames - propValues.keySet()).findAll { propName ->
-            !domainInstance."$propName"
-        }
+            log.debug "requiredMissingPropertyNames for ${domainClass.name} = ${requiredMissingPropertyNames}"
 
-        log.debug "requiredMissingPropertyNames for ${domainClass.name} = ${requiredMissingPropertyNames}"
-
-        for (propName in requiredMissingPropertyNames) {
-            createMissingProperty(domainInstance, propName, constrainedProperties["$propName"], circularCheckList)
+            for (propName in requiredMissingPropertyNames-owningProps) {
+                createMissingProperty(domainInstance, propName, constrainedProperties["$propName"], circularCheckList)
+            }
+            for (propName in requiredMissingPropertyNames.intersect(owningProps)) {
+                createMissingProperty(domainInstance, propName, constrainedProperties["$propName"], circularCheckList)
+            }
         }
 
         return domainInstance
@@ -186,7 +239,7 @@ public class DomainInstanceBuilder {
 
     def findMissingConfigValues(propValues) {
         def missingProperties = getConfigPropertyNames(domainClass.name) - propValues.keySet()
-        return getPropertyValues(domainClass.name, missingProperties, propValues)
+        return getPropertyValues(domainClass.name, missingProperties)
     }
 
     def createMissingProperty(domainInstance, propertyName, constrainedProperty, circularCheckList) {
@@ -226,15 +279,66 @@ public class DomainInstanceBuilder {
         constrainedProperty.validate(domain, domain."$propertyName", errors)
         return errors
     }
-    
+
     def save(domainInstance, circularTrap = []) {
-        if (circularTrap.contains(domainInstance) || domainInstance instanceof Enum) return
+        if (circularTrap.contains(domainInstance) || domainInstance instanceof Enum) return false
+
+        if(ownedProps) {
+            log.debug "${domainInstance.class.name} found domainProps that we need to save first: ${ownedProps}"
+            for (propertyName in ownedProps) {
+                if(domainInstance."$propertyName") {
+                    if(propertyIsToManyDomainClass(domainInstance."$propertyName".class)) {
+                        domainInstance."$propertyName".each { ownedProp ->
+                            if(propertyIsToOneDomainClass(ownedProp.class)) {
+                                ownedProp.buildCascadingSave(circularTrap)
+                            }
+                        }
+                    }
+                    else {
+                        domainInstance."$propertyName".buildCascadingSave(circularTrap + domainInstance)
+                    }
+                }
+            }
+        }
 
         if (propsToSaveFirst) {
             log.debug "${domainInstance.class.name} found domainProps that we need to save first: ${propsToSaveFirst}"
             for (propertyName in propsToSaveFirst) {
-                domainInstance."$propertyName".buildCascadingSave(circularTrap + domainInstance)
+                if(domainInstance."$propertyName") {
+                    if(propertyIsToManyDomainClass(domainInstance."$propertyName".class)) {
+                        domainInstance."$propertyName".each { ownedProp ->
+                            if(propertyIsToOneDomainClass(ownedProp.class)) {
+                                ownedProp.buildCascadingSave(circularTrap + domainInstance)
+                            }
+                        }
+                    }
+                    else {
+                        domainInstance."$propertyName".buildCascadingSave(circularTrap + domainInstance)
+                    }
+                }
             }
+        }
+
+        if (owningProps) {
+            log.debug "${domainInstance.class.name} found domainProps that we need to save first: ${owningProps}"
+            for (propertyName in owningProps) {
+                if(domainInstance."$propertyName") {
+                    if(propertyIsToManyDomainClass(domainInstance."$propertyName".class)) {
+                        domainInstance."$propertyName".each { ownedProp ->
+                            if(propertyIsToOneDomainClass(ownedProp.class)) {
+                                ownedProp.buildCascadingSave(circularTrap + domainInstance)
+                            }
+                        }
+                    }
+                    else {
+                        domainInstance."$propertyName".buildCascadingSave(circularTrap + domainInstance)
+                    }
+                }
+            }
+        }
+
+        if(circularTrap.contains(domainInstance) ) {
+            return domainInstance
         }
 
         if ((isAssignedKey(domainInstance) || domainInstance.ident() == null) && !domainInstance.save()) {
@@ -247,6 +351,8 @@ public class DomainInstanceBuilder {
         else {
             log.info "After ${domainInstance.class.name}.save() $domainInstance, success!"
         }
+
+        circularTrap << domainInstance
 
         return domainInstance
     }
